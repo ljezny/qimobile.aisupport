@@ -3,24 +3,24 @@
  */
 
 const OLLAMA_URL = "http://localhost:11434";
-const PROXY_URL = "http://localhost:8081";
+const PROXY_URL = "/api/soap";  // Use same-origin proxy endpoint
 let currentModel = null;
 
 // Knowledge Base Configuration
-const KB_CONFIG_KEY = 'qimobile_kb_config';
-let kbConfig = {
-    url: '',
-    username: '',
-    token: null,
-    soapUrl: null
-};
+const KB_TOKEN_KEY = 'qimobile_kb_token';
 
-// Demo connection defaults
-const DEMO_CONFIG = {
+// Connection credentials (constants)
+const KB_CONFIG = {
     url: 'https://qi.adaptica.cz/mobile',
     username: 'honza',
-    password: 'abcdefg'
+    password: 'abcdefg',
+    get soapUrl() {
+        return this.url.replace(/\/$/, '') + '/cgi-bin/icdisp.exe?act=soap';
+    }
 };
+
+// Current session token
+let kbToken = null;
 
 const SYSTEM_PROMPT = `Jsi support agent pro QI Mobile aplikaci. Pomáháš uživatelům s dotazy a problémy týkajícími se QI Mobile.
 
@@ -28,10 +28,11 @@ Tvé schopnosti:
 - Odpovídáš na dotazy ohledně použití QI Mobile aplikace
 - Pomáháš řešit technické problémy
 - Poskytneš návody a tipy pro efektivní práci
+- Pokud nenajdeš odpověď v knowledge base, přiznej to
 
 Pokud potřebuješ vyhledat informace v knowledge base, vrať POUZE tento JSON objekt (bez dalšího textu):
-{"action": "kb_search", "query": "hledaný text"}
-Hledaný text musí být klíčové slovo, nesmí to být fráze. Např. QIMobile nebo faktura.
+{"action": "kb_search", "query": "HLEDANÉ_KLÍČOVÉ_SLOVO"}
+HLEDANÉ_KLÍČOVÉ_SLOVO musí být jedno klíčové slovo, nesmí to být fráze. Např. QIMobile nebo faktura.
 
 Knowledge base vrátí články s obsahem. Použij tyto informace k odpovědi uživateli.
 
@@ -60,34 +61,29 @@ const configStatus = document.getElementById('configStatus');
 document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
     setupConfigModal();
-    loadKbConfig();
+    loadKbToken();
     userInput.focus();
     await detectModel();
     await autoLoginIfNeeded();
 });
 
 /**
- * Auto-login with demo credentials if not already logged in
+ * Auto-login if not already logged in
  */
 async function autoLoginIfNeeded() {
-    if (kbConfig.token) {
-        console.log('✅ Already logged in to KB, ticket:', kbConfig.token.substring(0, 20) + '...');
+    if (kbToken) {
+        console.log('✅ Already logged in to KB, ticket:', kbToken.substring(0, 20) + '...');
         updateKbStatus(true);
         return;
     }
     
-    console.log('🔄 Auto-login to KB with demo credentials...');
+    console.log('🔄 Auto-login to KB...');
     
     try {
-        const token = await kbLogin(DEMO_CONFIG.url, DEMO_CONFIG.username, DEMO_CONFIG.password);
+        kbToken = await kbLogin();
+        saveKbToken();
         
-        kbConfig.url = DEMO_CONFIG.url;
-        kbConfig.username = DEMO_CONFIG.username;
-        kbConfig.token = token;
-        kbConfig.soapUrl = `${DEMO_CONFIG.url.replace(/\/$/, '')}/cgi-bin/icdisp.exe?act=soap`;
-        saveKbConfig();
-        
-        console.log('✅ Auto-login successful, ticket:', token.substring(0, 20) + '...');
+        console.log('✅ Auto-login successful, ticket:', kbToken.substring(0, 20) + '...');
         updateKbStatus(true);
     } catch (error) {
         console.warn('⚠️ Auto-login failed:', error.message);
@@ -100,7 +96,7 @@ async function autoLoginIfNeeded() {
  */
 function updateKbStatus(connected, errorMessage = null) {
     const statusText = connected 
-        ? `<span style="color: #2e7d32">✅ KB připojeno (${kbConfig.username}@${new URL(kbConfig.url).hostname})</span>`
+        ? `<span style="color: #2e7d32">✅ KB připojeno (${KB_CONFIG.username}@${new URL(KB_CONFIG.url).hostname})</span>`
         : `<span style="color: #c62828">❌ KB nepřipojeno${errorMessage ? ': ' + errorMessage : ''}</span>`;
     
     const firstMessage = chatMessages.querySelector('.message.assistant .message-content p');
@@ -329,10 +325,10 @@ function tryParseAction(text) {
 async function kbSearch(query) {
     console.group('🔍 KB Search');
     console.log('Query:', query);
-    console.log('Token:', kbConfig.token ? '✅ Present' : '❌ Missing');
-    console.log('SOAP URL:', kbConfig.soapUrl || 'Not set');
+    console.log('Token:', kbToken ? '✅ Present' : '❌ Missing');
+    console.log('SOAP URL:', KB_CONFIG.soapUrl || 'Not set');
     
-    if (!kbConfig.token) {
+    if (!kbToken) {
         console.warn('KB not configured!');
         console.groupEnd();
         return JSON.stringify({
@@ -343,7 +339,7 @@ async function kbSearch(query) {
     
     try {
         const xmlResult = await soapGetFunctionData(
-            kbConfig.token,
+            kbToken,
             "1358186,11241",  // FunctionID for KB search
             "",               // MasterID
             `1274788,11241=${query}`,  // Filter field with search query
@@ -371,11 +367,53 @@ async function kbSearch(query) {
         });
     } catch (error) {
         console.error('KB Search error:', error);
+        
+        // Check if ticket expired - try to re-login
+        if (error.message && error.message.includes('expired')) {
+            console.log('🔄 Ticket expired, attempting re-login...');
+            const reloginSuccess = await attemptRelogin();
+            
+            if (reloginSuccess) {
+                console.log('✅ Re-login successful, retrying search...');
+                console.groupEnd();
+                // Retry the search with new ticket
+                return await kbSearch(query);
+            }
+        }
+        
         console.groupEnd();
         return JSON.stringify({
             status: "error",
             message: error.message
         });
+    }
+}
+
+/**
+ * Attempt to re-login with stored credentials
+ */
+async function attemptRelogin() {
+    console.group('🔐 Re-login attempt');
+    
+    try {
+        // Clear old token
+        kbToken = null;
+        
+        console.log('URL:', KB_CONFIG.url);
+        console.log('Username:', KB_CONFIG.username);
+        
+        kbToken = await kbLogin();
+        saveKbToken();
+        
+        console.log('✅ Re-login successful, new ticket:', kbToken.substring(0, 20) + '...');
+        updateKbStatus(true);
+        console.groupEnd();
+        return true;
+    } catch (error) {
+        console.error('❌ Re-login failed:', error.message);
+        updateKbStatus(false, 'Session expired, re-login failed');
+        console.groupEnd();
+        return false;
     }
 }
 
@@ -453,7 +491,7 @@ async function soapGetFunctionData(ticket, functionId, masterId, filter, activeF
 </soap:Envelope>`;
 
     console.group('📡 SOAP MCLGetFunction');
-    console.log('URL:', kbConfig.soapUrl);
+    console.log('URL:', KB_CONFIG.soapUrl);
     console.log('FunctionID:', functionId);
     console.log('Filter:', filter);
     console.log('Request:', soapEnvelope);
@@ -462,7 +500,7 @@ async function soapGetFunctionData(ticket, functionId, masterId, filter, activeF
         method: 'POST',
         headers: {
             'Content-Type': 'text/xml; charset=utf-8',
-            'X-Target-URL': kbConfig.soapUrl
+            'X-Target-URL': KB_CONFIG.soapUrl
         },
         body: soapEnvelope
     });
@@ -521,10 +559,10 @@ function setupConfigModal() {
 }
 
 function openConfigModal() {
-    // Pre-fill form with saved config or demo defaults
-    document.getElementById('kbUrl').value = kbConfig.url || DEMO_CONFIG.url;
-    document.getElementById('kbUsername').value = kbConfig.username || DEMO_CONFIG.username;
-    document.getElementById('kbPassword').value = kbConfig.token ? '' : DEMO_CONFIG.password;
+    // Pre-fill form with constants (read-only display)
+    document.getElementById('kbUrl').value = KB_CONFIG.url;
+    document.getElementById('kbUsername').value = KB_CONFIG.username;
+    document.getElementById('kbPassword').value = kbToken ? '********' : KB_CONFIG.password;
     setConfigStatus('', '');
     configModal.classList.add('active');
 }
@@ -533,55 +571,32 @@ function closeConfigModal() {
     configModal.classList.remove('active');
 }
 
-function loadKbConfig() {
+function loadKbToken() {
     try {
-        const saved = localStorage.getItem(KB_CONFIG_KEY);
-        if (saved) {
-            const parsed = JSON.parse(saved);
-            kbConfig.url = parsed.url || '';
-            kbConfig.username = parsed.username || '';
-            kbConfig.token = parsed.token || null;
-            kbConfig.soapUrl = parsed.soapUrl || null;
-            
-            if (kbConfig.token) {
-                console.log('📦 KB Config loaded from localStorage');
-                console.log('   URL:', kbConfig.url);
-                console.log('   User:', kbConfig.username);
-                console.log('   Ticket:', kbConfig.token.substring(0, 20) + '...');
-            }
+        kbToken = localStorage.getItem(KB_TOKEN_KEY) || null;
+        if (kbToken) {
+            console.log('📦 KB Token loaded from localStorage:', kbToken.substring(0, 20) + '...');
         }
     } catch (e) {
-        console.error('Failed to load KB config:', e);
+        console.error('Failed to load KB token:', e);
     }
 }
 
-function saveKbConfig() {
+function saveKbToken() {
     try {
-        const config = {
-            url: kbConfig.url,
-            username: kbConfig.username,
-            token: kbConfig.token,
-            soapUrl: kbConfig.soapUrl
-        };
-        localStorage.setItem(KB_CONFIG_KEY, JSON.stringify(config));
-        console.log('💾 KB Config saved to localStorage');
-        console.log('   Ticket:', kbConfig.token ? kbConfig.token.substring(0, 20) + '...' : 'none');
+        if (kbToken) {
+            localStorage.setItem(KB_TOKEN_KEY, kbToken);
+            console.log('💾 KB Token saved:', kbToken.substring(0, 20) + '...');
+        } else {
+            localStorage.removeItem(KB_TOKEN_KEY);
+        }
     } catch (e) {
-        console.error('Failed to save KB config:', e);
+        console.error('Failed to save KB token:', e);
     }
 }
 
 async function handleConfigSubmit(e) {
     e.preventDefault();
-    
-    const url = document.getElementById('kbUrl').value.trim();
-    const username = document.getElementById('kbUsername').value.trim();
-    const password = document.getElementById('kbPassword').value;
-    
-    if (!url || !username || !password) {
-        setConfigStatus('Vyplňte všechna pole', 'error');
-        return;
-    }
     
     const saveBtn = document.getElementById('configSave');
     saveBtn.disabled = true;
@@ -589,16 +604,12 @@ async function handleConfigSubmit(e) {
     setConfigStatus('', '');
     
     try {
-        const token = await kbLogin(url, username, password);
-        
-        kbConfig.url = url;
-        kbConfig.username = username;
-        kbConfig.token = token;
-        kbConfig.soapUrl = `${url.replace(/\/$/, '')}/cgi-bin/icdisp.exe?act=soap`;
-        saveKbConfig();
+        kbToken = await kbLogin();
+        saveKbToken();
         
         setConfigStatus('Přihlášení úspěšné!', 'success');
-        console.log('KB Login successful, ticket:', token);
+        console.log('KB Login successful, ticket:', kbToken);
+        updateKbStatus(true);
         
         setTimeout(() => {
             closeConfigModal();
@@ -613,13 +624,10 @@ async function handleConfigSubmit(e) {
 }
 
 /**
- * Login to Knowledge Base API via SOAP
+ * Login to Knowledge Base API via SOAP (uses KB_CONFIG constants)
  */
-async function kbLogin(url, username, password) {
-    // Build SOAP endpoint URL
-    const soapUrl = `${url.replace(/\/$/, '')}/cgi-bin/icdisp.exe?act=soap`;
-    
-    // Build SOAP envelope for LoginMobile
+async function kbLogin() {
+    // Build SOAP envelope for LoginMobile using constants
     const soapEnvelope = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
@@ -627,14 +635,14 @@ async function kbLogin(url, username, password) {
                xmlns:q1="urn:AppServer">
     <soap:Body>
         <q1:LoginMobile>
-            <q1:User>${escapeXml(username)}</q1:User>
-            <q1:Password>${escapeXml(password)}</q1:Password>
+            <q1:User>${escapeXml(KB_CONFIG.username)}</q1:User>
+            <q1:Password>${escapeXml(KB_CONFIG.password)}</q1:Password>
         </q1:LoginMobile>
     </soap:Body>
 </soap:Envelope>`;
 
     console.group('🔐 SOAP LoginMobile');
-    console.log('URL:', soapUrl);
+    console.log('URL:', KB_CONFIG.soapUrl);
     console.log('Request:', soapEnvelope);
 
     // Use proxy to avoid CORS
@@ -642,7 +650,7 @@ async function kbLogin(url, username, password) {
         method: 'POST',
         headers: {
             'Content-Type': 'text/xml; charset=utf-8',
-            'X-Target-URL': soapUrl
+            'X-Target-URL': KB_CONFIG.soapUrl
         },
         body: soapEnvelope
     });
