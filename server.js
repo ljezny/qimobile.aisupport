@@ -44,6 +44,21 @@ buildSymbolIndex();
 
 const OLLAMA_URL = 'http://localhost:11434';
 
+// QI Knowledge Base configuration
+const QI_KB_URL = 'https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe';
+const QI_KB_TOKEN = 'TMdNtV07ChkKON2HLpql04PS56B5PjqLuKU6Qxqrdb/1+ZWr0Sfdx+ei0SQ4M+A84TL+RDYwbOtL4YuSRbEuSbHOsfWHPWJFeO2ir05v8ef1WjdP7jUjgBz7SxxU1vUL';
+
+// QI Area FunctionIDs
+const QI_FUNCTION_IDS = {
+    'summary': '1630881,10',       // Souhrn informací o čemkoliv
+    'knowledge': '1274730,11241',  // Knowledgebase (návody, postupy, znalosti)
+    'helpdesk': '1705522,11241',   // Požadavek (helpdesk, tickety)
+    'task': '440156,11241',        // Úkol
+    'partner': '81568,11241',      // Karta obchodního partnera
+    'invoice': '440318,11241',     // Faktury
+    'receivable': '41078,10'       // Neuhrazené pohledávky
+};
+
 const server = http.createServer((req, res) => {
     const parsedUrl = url.parse(req.url, true);
     
@@ -76,6 +91,12 @@ const server = http.createServer((req, res) => {
         buildSymbolIndex();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', indexed: new Date().toISOString() }));
+        return;
+    }
+    
+    // QI Knowledge Base proxy endpoint
+    if (parsedUrl.pathname === '/api/qi-kb') {
+        handleQiKbProxy(req, res, parsedUrl.query);
         return;
     }
     
@@ -151,6 +172,126 @@ function handleSoapProxy(req, res) {
 }
 
 /**
+ * Handle QI Knowledge Base proxy requests
+ * Calls the QI KB API and parses the HTML response
+ */
+function handleQiKbProxy(req, res, query) {
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    // Handle preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    
+    const searchQuery = query.query || '';
+    const area = query.area || 'knowledge';
+    const functionId = QI_FUNCTION_IDS[area] || QI_FUNCTION_IDS['knowledge'];
+    const encodedToken = encodeURIComponent(QI_KB_TOKEN);
+    const targetUrl = `${QI_KB_URL}?token=${encodedToken}`;
+    
+    console.log(`📚 QI KB Search: "${searchQuery}" (area: ${area})`);
+    
+    const options = {
+        hostname: 'qi.adaptica.cz',
+        port: 443,
+        path: `/mobile/cgi-bin/icdisp.exe?token=${encodedToken}`,
+        method: 'GET',
+        headers: {
+            'X-FunctionID': functionId,
+            'X-UserFilter': searchQuery
+        }
+    };
+    
+    const proxyReq = https.request(options, (proxyRes) => {
+        let responseBody = '';
+        proxyRes.on('data', chunk => responseBody += chunk);
+        proxyRes.on('end', () => {
+            // Handle redirect - follow it
+            if (proxyRes.statusCode === 302) {
+                const redirectOptions = { ...options };
+                const redirectReq = https.request(redirectOptions, (redirectRes) => {
+                    let redirectBody = '';
+                    redirectRes.on('data', chunk => redirectBody += chunk);
+                    redirectRes.on('end', () => {
+                        sendQiKbResponse(res, redirectBody, searchQuery);
+                    });
+                });
+                redirectReq.on('error', (err) => {
+                    console.error('QI KB redirect error:', err.message);
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ status: 'error', message: err.message }));
+                });
+                redirectReq.end();
+                return;
+            }
+            
+            sendQiKbResponse(res, responseBody, searchQuery);
+        });
+    });
+    
+    proxyReq.on('error', (err) => {
+        console.error('QI KB error:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', message: err.message }));
+    });
+    
+    proxyReq.end();
+}
+
+/**
+ * Parse QI KB HTML response and send JSON
+ */
+function sendQiKbResponse(res, responseBody, query) {
+    let content = responseBody;
+    
+    // Check if response is HTML (contains <html or <div class="content">)
+    if (responseBody.includes('<html') || responseBody.includes('<div class="content">')) {
+        // Extract content from <div class="content">...</div>
+        const contentMatch = responseBody.match(/<div class="content">\s*([\s\S]*?)\s*<\/div>/i);
+        
+        if (contentMatch && contentMatch[1]) {
+            content = contentMatch[1].trim();
+            // Remove any remaining HTML tags
+            content = content.replace(/<[^>]*>/g, '').trim();
+        }
+    }
+    
+    // Remove debug header lines (Connection:, Host:, etc.)
+    const lines = content.split(/[\r\n]+/);
+    const filteredLines = lines.filter(line => {
+        const trimmed = line.trim();
+        return trimmed && 
+               !trimmed.startsWith('Connection:') && 
+               !trimmed.startsWith('Host:') && 
+               !trimmed.startsWith('User-agent:') &&
+               !trimmed.startsWith('Accept:') &&
+               !trimmed.startsWith('X-functionid:') &&
+               !trimmed.startsWith('X-userfilter:');
+    });
+    content = filteredLines.join('\n').trim();
+    
+    // Check if it's "Nejsou data" response
+    const hasData = content && content !== 'Nejsou data' && content.length > 0;
+    
+    const result = {
+        status: 'success',
+        query: query,
+        content: content || 'Žádné výsledky',
+        hasData: content && content !== 'Nejsou data'
+    };
+    
+    console.log(`📚 QI KB Result: ${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+}
+
+/**
  * Handle Ollama API proxy requests
  * Forwards requests to local Ollama instance
  */
@@ -170,14 +311,23 @@ function handleOllamaProxy(req, res, pathname) {
     // Remove /api/ollama prefix to get actual Ollama path
     const ollamaPath = pathname.replace('/api/ollama', '') || '/';
     const targetUrl = `${OLLAMA_URL}${ollamaPath}`;
+    const startTime = Date.now();
     
-    console.log(`🤖 Ollama Proxy: ${req.method} ${ollamaPath}`);
+    console.log(`🤖 [${new Date().toISOString()}] Ollama Proxy: ${req.method} ${ollamaPath}`);
     
     // Collect request body
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', () => {
         const parsed = new URL(targetUrl);
+        
+        // Log request details for /api/chat
+        if (ollamaPath === '/api/chat') {
+            try {
+                const reqBody = JSON.parse(body);
+                console.log(`🤖 [${new Date().toISOString()}] Chat request: model=${reqBody.model}, messages=${reqBody.messages?.length}, tools=${reqBody.tools?.length || 0}`);
+            } catch (e) {}
+        }
         
         const options = {
             hostname: parsed.hostname,
@@ -198,12 +348,21 @@ function handleOllamaProxy(req, res, pathname) {
                 'Transfer-Encoding': proxyRes.headers['transfer-encoding'] || 'chunked'
             });
             
-            proxyRes.on('data', chunk => res.write(chunk));
-            proxyRes.on('end', () => res.end());
+            let responseSize = 0;
+            proxyRes.on('data', chunk => {
+                responseSize += chunk.length;
+                res.write(chunk);
+            });
+            proxyRes.on('end', () => {
+                const duration = Date.now() - startTime;
+                console.log(`🤖 [${new Date().toISOString()}] Ollama response: ${proxyRes.statusCode}, ${responseSize} bytes, ${duration}ms`);
+                res.end();
+            });
         });
         
         proxyReq.on('error', (err) => {
-            console.error('Ollama proxy error:', err.message);
+            const duration = Date.now() - startTime;
+            console.error(`🤖 [${new Date().toISOString()}] Ollama proxy error after ${duration}ms:`, err.message);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: err.message }));
         });

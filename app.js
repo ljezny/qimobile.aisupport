@@ -14,28 +14,58 @@ Tvé schopnosti:
 - Odpovídáš na dotazy ohledně použití QI Mobile aplikace
 - Pomáháš řešit technické problémy
 - Poskytneš návody a tipy pro efektivní práci
-- Máš přístup k knowledge base (kb_search) pro vyhledávání informací
+- Máš přístup k QI systému (qi_search) pro vyhledávání v různých oblastech
 
-DŮLEŽITÉ: Když voláš nástroj (tool), NIKDY nevypisuj své myšlenky ani uvažování. Prostě zavolej nástroj.
+DŮLEŽITÉ pro qi_search:
+- Do query zadávej POUZE klíčová slova: názvy, jména, specifické termíny
+- NEZADÁVEJ obecné výrazy jako "faktury", "nezaplacené", "problémy", "informace"
+- Kontext urči výběrem správné area, ne obecnými slovy v query
+- Příklady:
+  * "Dingo nezaplacené faktury" → query: "Dingo", area: "invoice"
+  * "problém s projektem Tuňák" → query: "Tuňák", area: "helpdesk"
+  * "kontakt na firmu ABC" → query: "ABC", area: "partner"
+  * "návod na synchronizaci" → query: "synchronizace", area: "knowledge"
+- Můžeš kombinovat více klíčových slov: "Novák Praha" (AND)
+- Vyber správnou oblast (area):
+  * summary - obecný souhrn informací (výchozí)
+  * knowledge - návody, postupy, znalosti
+  * helpdesk - požadavky, tickety
+  * task - úkoly
+  * partner - obchodní partneři, kontakty
+  * invoice - faktury
+  * receivable - neuhrazené pohledávky, dlužné částky
+
+DŮLEŽITÉ: 
+- Když voláš nástroj (tool), NIKDY nevypisuj své myšlenky ani uvažování. Prostě zavolej nástroj.
+- Když máš dostatek informací pro odpověď, IHNED odpověz uživateli textovou zprávou.
+- Data obsahují SOUHRNNÉ ÚDAJE (Neuhrazeno, Cena celkem, Zaplaceno celkem) - použij je pro odpověď.
 
 Buď přátelský, stručný a užitečný. Odpovídej vždy česky.`;
 
 // Tool definitions in OpenAI/Ollama format
+// Maximum characters to send to AI (truncation limit)
+const QI_MAX_RESULT_LENGTH = 8000;
+
 const TOOLS = [
     {
         type: "function",
         function: {
-            name: "kb_search",
-            description: "Vyhledá informace na Wikipedii. Použij pro hledání faktů a informací.",
+            name: "qi_search",
+            description: "Vyhledá informace v QI systému. Použij pro hledání souhrnu informací, v knowledge base, helpdesku, úkolech, obchodních partnerech nebo fakturách.",
             parameters: {
                 type: "object",
                 properties: {
                     query: {
                         type: "string",
-                        description: "Hledaný text nebo klíčová slova"
+                        description: "Klíčová slova pro vyhledání (může být více slov oddělených mezerou)"
+                    },
+                    area: {
+                        type: "string",
+                        enum: ["summary", "knowledge", "helpdesk", "task", "partner", "invoice", "receivable"],
+                        description: "Oblast vyhledávání: summary (obecný souhrn - výchozí), knowledge (návody, znalosti), helpdesk (tickety), task (úkoly), partner (obchodní partneři), invoice (faktury), receivable (neuhrazené pohledávky)"
                     }
                 },
-                required: ["query"]
+                required: ["query", "area"]
             }
         }
     }
@@ -108,13 +138,9 @@ function getTimeString() {
     return now.toLocaleTimeString('cs-CZ', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function formatJson(obj, maxLength = 500) {
+function formatJson(obj) {
     try {
-        const str = JSON.stringify(obj, null, 2);
-        if (str.length > maxLength) {
-            return str.substring(0, maxLength) + '\n... (zkráceno)';
-        }
-        return str;
+        return JSON.stringify(obj, null, 2);
     } catch (e) {
         return String(obj);
     }
@@ -313,7 +339,7 @@ async function handleSubmit(e) {
  */
 async function ask(userText) {
     conversationHistory.push({ role: "user", content: userText });
-    addLogEntry('info', `User message: "${userText.substring(0, 100)}${userText.length > 100 ? '...' : ''}"`);
+    addLogEntry('info', `User message: "${userText}"`);
 
     const maxSteps = 60;
     for (let i = 0; i < maxSteps; i++) {
@@ -337,8 +363,8 @@ async function ask(userText) {
                 addLogEntry('tool', `Executing: ${funcName}()`, { arguments: args });
                 
                 let result;
-                if (funcName === "kb_search") {
-                    result = await kbSearch(args.query);
+                if (funcName === "qi_search") {
+                    result = await qiSearch(args.query, args.area);
                 } else {
                     result = JSON.stringify({ error: `Unknown tool: ${funcName}` });
                 }
@@ -371,8 +397,8 @@ async function ask(userText) {
         addLogEntry('tool', `Legacy JSON action detected: ${action.action}`, action);
         
         let result;
-        if (action.action === "kb_search") {
-            result = await kbSearch(action.query);
+        if (action.action === "qi_search") {
+            result = await qiSearch(action.query, action.area || 'knowledge');
         } else {
             // Unknown action, treat as final response
             conversationHistory.push({ role: "assistant", content: content });
@@ -403,9 +429,14 @@ async function ollamaChat(messages) {
         messages: messages,
         stream: false,
         options: {
-            temperature: 0  // Reduce randomness to prevent "thinking out loud"
+            temperature: 0,  // Reduce randomness to prevent "thinking out loud"
+            num_ctx: 131072  // Maximum context window size (128K tokens)
         }
     };
+    
+    // Calculate approximate token count (rough estimate: ~4 chars per token)
+    const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+    const estimatedTokens = Math.ceil(totalChars / 4);
     
     // Add tools if model supports them
     if (supportsNativeTools) {
@@ -416,22 +447,42 @@ async function ollamaChat(messages) {
     addLogEntry('request', `POST /api/chat → ${currentModel}`, {
         model: payload.model,
         messages_count: messages.length,
-        system_prompt: messages.find(m => m.role === 'system')?.content.substring(0, 200) + '...',
+        estimated_input_tokens: estimatedTokens,
+        context_window: payload.options.num_ctx,
+        system_prompt: messages.find(m => m.role === 'system')?.content,
         last_message: messages[messages.length - 1],
         tools_enabled: supportsNativeTools,
         tools: supportsNativeTools ? TOOLS : []
     });
 
     let response;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        controller.abort();
+        addLogEntry('error', 'Request timeout after 120s');
+    }, 120000); // 120 second timeout
+    
     try {
+        addLogEntry('info', 'Sending request to Ollama...');
+        const startTime = Date.now();
+        
         response = await fetch(`${OLLAMA_URL}/api/chat`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: controller.signal
         });
+        
+        clearTimeout(timeoutId);
+        addLogEntry('info', `Response received in ${Date.now() - startTime}ms`);
     } catch (networkError) {
+        clearTimeout(timeoutId);
+        if (networkError.name === 'AbortError') {
+            addLogEntry('error', 'Request aborted (timeout)');
+            throw new Error('Ollama neodpověděla včas (timeout 120s). Model může být přetížený.');
+        }
         addLogEntry('error', 'Network error', { error: networkError.message });
         throw new Error(
             `Nelze se připojit k Ollama. Ujistěte se, že:\n` +
@@ -448,14 +499,17 @@ async function ollamaChat(messages) {
 
     const data = await response.json();
     
-    // Log the response
+    // Log the response with token counts
     const hasToolCalls = data.message.tool_calls && data.message.tool_calls.length > 0;
     addLogEntry('response', hasToolCalls ? '← Tool call requested' : '← Response received', {
-        content: data.message.content ? data.message.content.substring(0, 300) + (data.message.content.length > 300 ? '...' : '') : '(empty)',
+        content: data.message.content || '(empty)',
         tool_calls: data.message.tool_calls || null,
-        eval_count: data.eval_count,
-        eval_duration_ms: data.eval_duration ? Math.round(data.eval_duration / 1_000_000) : null,
-        total_duration_ms: data.total_duration ? Math.round(data.total_duration / 1_000_000) : null
+        prompt_tokens: data.prompt_eval_count,    // Input tokens
+        output_tokens: data.eval_count,           // Generated tokens
+        total_tokens: (data.prompt_eval_count || 0) + (data.eval_count || 0),
+        prompt_eval_ms: data.prompt_eval_duration ? Math.round(data.prompt_eval_duration / 1_000_000) : null,
+        eval_ms: data.eval_duration ? Math.round(data.eval_duration / 1_000_000) : null,
+        total_ms: data.total_duration ? Math.round(data.total_duration / 1_000_000) : null
     });
     
     // Return full message object to preserve tool_calls
@@ -477,7 +531,7 @@ function tryParseAction(text) {
 
     try {
         const obj = JSON.parse(text);
-        if (obj.action === 'kb_search') {
+        if (obj.action === 'qi_search') {
             return obj;
         }
     } catch (e) {
@@ -488,15 +542,14 @@ function tryParseAction(text) {
 }
 
 /**
- * Knowledge base search - calls Wikipedia API
+ * QI System search - calls QI API for different areas
+ * Returns truncated results to fit in context window
  */
-async function kbSearch(query) {
-    addLogEntry('request', `Wikipedia search`, { query });
+async function qiSearch(query, area = 'knowledge') {
+    addLogEntry('request', `QI search`, { query, area });
     
     try {
-        // Call Czech Wikipedia API
-        const url = `https://cs.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&origin=*&srlimit=5`;
-        
+        const url = `/api/qi-kb?query=${encodeURIComponent(query)}&area=${encodeURIComponent(area)}`;
         const response = await fetch(url);
         
         if (!response.ok) {
@@ -504,34 +557,39 @@ async function kbSearch(query) {
         }
         
         const data = await response.json();
-        addLogEntry('response', 'Wikipedia response', data);
+        let content = data.content || "Žádné výsledky";
+        const originalLength = content.length;
+        let truncated = false;
         
-        if (data.query && data.query.search && data.query.search.length > 0) {
-            const results = data.query.search.map(item => ({
-                title: item.title,
-                snippet: item.snippet.replace(/<[^>]*>/g, ''),  // Remove HTML tags
-                pageid: item.pageid
-            }));
-            
-            return JSON.stringify({
-                status: "success",
-                query: query,
-                results: results
-            });
+        // Truncate if too long
+        if (content.length > QI_MAX_RESULT_LENGTH) {
+            content = content.substring(0, QI_MAX_RESULT_LENGTH);
+            truncated = true;
         }
+        
+        addLogEntry('response', 'QI response', { 
+            query, 
+            area, 
+            original_length: originalLength,
+            returned_length: content.length,
+            truncated: truncated
+        });
         
         return JSON.stringify({
             status: "success",
             query: query,
-            results: [],
-            message: "Žádné výsledky"
+            area: area,
+            content: content,
+            truncated: truncated,
+            original_length: originalLength,
+            message: truncated ? `Výsledky zkráceny z ${originalLength} na ${QI_MAX_RESULT_LENGTH} znaků.` : null
         });
         
     } catch (error) {
-        addLogEntry('error', 'Wikipedia search exception', { error: error.message });
+        addLogEntry('error', 'QI search exception', { error: error.message });
         return JSON.stringify({
             status: "error",
-            message: `Chyba při vyhledávání: ${error.message}`
+            message: `Chyba při vyhledávání v QI: ${error.message}`
         });
     }
 }
