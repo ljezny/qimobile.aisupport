@@ -1,0 +1,34 @@
+📚 Building symbol index...
+✅ Symbol index built in 9827ms:
+   - Classes: 317
+   - Interfaces: 24
+   - Methods: 1395
+   - Properties: 732
+   - Enums: 14
+   - Fields: 5851
+   - Localizations: 597
+
+🚀 QI Mobile AI Support Server
+   
+   Local:  http://localhost:8080
+   
+   Endpoints:
+   - Static files: http://localhost:8080/
+   - SOAP Proxy:   http://localhost:8080/api/soap
+   - Code Search:  http://localhost:8080/api/code-search
+   
+   Press Ctrl+C to stop
+
+(node:67162) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+🔎 Symbol Search: "NFC" (type: all, class: any)
+🔎 Symbol Search: "ViewAdapter" (type: classes, class: any)
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+🔎 Symbol Search: "GASTON" (type: classes, class: any)
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+📡 SOAP Proxy: POST -> https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?act=soap
+🔍 Code Search: "NFC" (pattern: *.cs)
