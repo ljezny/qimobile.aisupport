@@ -48,16 +48,88 @@ const OLLAMA_URL = 'http://localhost:11434';
 const QI_KB_URL = 'https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe';
 const QI_KB_TOKEN = 'TMdNtV07ChkKON2HLpql04PS56B5PjqLuKU6Qxqrdb/1+ZWr0Sfdx+ei0SQ4M+A84TL+RDYwbOtL4YuSRbEuSbHOsfWHPWJFeO2ir05v8ef1WjdP7jUjgBz7SxxU1vUL';
 
-// QI Area FunctionIDs
-const QI_FUNCTION_IDS = {
-    'summary': '1630881,10',       // Souhrn informací o čemkoliv
-    'knowledge': '1274730,11241',  // Knowledgebase (návody, postupy, znalosti)
-    'helpdesk': '1705522,11241',   // Požadavek (helpdesk, tickety)
-    'task': '440156,11241',        // Úkol
-    'partner': '81568,11241',      // Karta obchodního partnera
-    'invoice': '440318,11241',     // Faktury
-    'receivable': '41078,10'       // Neuhrazené pohledávky
-};
+// QI Configuration URL (different token for schema)
+const QI_CONFIG_URL = 'https://qi.adaptica.cz/mobile/cgi-bin/icdisp.exe?token=TMdNtV07ChkKON2HLpql0z%2BMufBjgnb9vhcozlBtymT1%2BZWr0Sfdx%2Bei0SQ4M%2BA84TL%2BRDYwbOtL4YuSRbEuSbHOsfWHPWJFeO2ir05v8ef1WjdP7jUjgBz7SxxU1vUL';
+
+// QI Configuration - loaded from URL
+let QI_CONFIG = null;
+let QI_AREAS_MAP = {};
+
+/**
+ * Transform QI API schema to our config format
+ */
+function transformQiSchema(apiData) {
+    const areas = apiData.map(item => {
+        // Collect all fields from all datasets
+        const allFields = {};
+        if (item.DataSets) {
+            item.DataSets.forEach(ds => {
+                if (ds.Fields) {
+                    ds.Fields.forEach(fieldObj => {
+                        // Field is { "fieldId": "fieldName" }
+                        Object.entries(fieldObj).forEach(([id, name]) => {
+                            allFields[id] = name;
+                        });
+                    });
+                }
+            });
+        }
+        
+        return {
+            id: item.FunctionID,
+            name: item.Name,
+            description: item.Description || item.Name,
+            functionId: item.FunctionID,
+            fields: allFields,  // { fieldId: fieldName }
+            projection: Object.values(allFields).slice(0, 10) // First 10 field names for display
+        };
+    });
+    
+    return {
+        areas: areas,
+        defaults: {
+            maxResults: 10,
+            maxChars: 8000
+        }
+    };
+}
+
+/**
+ * Load QI configuration from URL
+ */
+function loadQiConfig() {
+    return new Promise((resolve) => {
+        console.log('📡 Loading QI config from URL...');
+        
+        https.get(QI_CONFIG_URL, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const apiData = JSON.parse(data);
+                    QI_CONFIG = transformQiSchema(apiData);
+                    
+                    // Build lookup map by NAME for quick access (AI sends names)
+                    QI_AREAS_MAP = {};
+                    QI_CONFIG.areas.forEach(area => { QI_AREAS_MAP[area.name] = area; });
+                    
+                    console.log(`✅ QI config loaded: ${QI_CONFIG.areas.length} areas`);
+                    QI_CONFIG.areas.forEach(a => console.log(`   - ${a.name} (${Object.keys(a.fields).length} fields)`));
+                    resolve(true);
+                } catch (error) {
+                    console.error(`❌ Failed to parse QI config: ${error.message}`);
+                    resolve(false);
+                }
+            });
+        }).on('error', (error) => {
+            console.error(`❌ Failed to load QI config: ${error.message}`);
+            resolve(false);
+        });
+    });
+}
+
+// Load config on startup
+loadQiConfig();
 
 const server = http.createServer((req, res) => {
     const parsedUrl = url.parse(req.url, true);
@@ -97,6 +169,12 @@ const server = http.createServer((req, res) => {
     // QI Knowledge Base proxy endpoint
     if (parsedUrl.pathname === '/api/qi-kb') {
         handleQiKbProxy(req, res, parsedUrl.query);
+        return;
+    }
+    
+    // QI Configuration endpoint
+    if (parsedUrl.pathname === '/api/qi-config') {
+        handleQiConfig(req, res);
         return;
     }
     
@@ -189,22 +267,46 @@ function handleQiKbProxy(req, res, query) {
     }
     
     const searchQuery = query.query || '';
-    const area = query.area || 'knowledge';
-    const functionId = QI_FUNCTION_IDS[area] || QI_FUNCTION_IDS['knowledge'];
-    const encodedToken = encodeURIComponent(QI_KB_TOKEN);
-    const targetUrl = `${QI_KB_URL}?token=${encodedToken}`;
+    const area = query.area || '';
+    const fields = query.fields || ''; // Field IDs separated by ;
     
-    console.log(`📚 QI KB Search: "${searchQuery}" (area: ${area})`);
+    // Find area config by name, fallback to first area
+    let areaConfig = QI_AREAS_MAP[area];
+    if (!areaConfig && QI_CONFIG && QI_CONFIG.areas.length > 0) {
+        areaConfig = QI_CONFIG.areas[0];
+        console.log(`⚠️ Area "${area}" not found, using default: ${areaConfig.name}`);
+    }
+    
+    if (!areaConfig) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', message: 'QI config not loaded' }));
+        return;
+    }
+    
+    const functionId = areaConfig.functionId;
+    const encodedToken = encodeURIComponent(QI_KB_TOKEN);
+    
+    console.log(`📚 QI KB Search: "${searchQuery}" (area: ${areaConfig.name}, fields: ${fields || 'all'})`);
+    
+    // Convert UTF-8 to binary string for Node.js header compatibility
+    // This preserves raw UTF-8 bytes while bypassing Node.js ASCII validation
+    const userFilterHeader = Buffer.from(searchQuery, 'utf8').toString('latin1');
+    const fieldsHeader = fields ? Buffer.from(fields, 'utf8').toString('latin1') : '';
+    
+    const headers = {
+        'X-FunctionID': functionId,
+        'X-UserFilter': userFilterHeader
+    };
+    if (fieldsHeader) {
+        headers['X-Fields'] = fieldsHeader;
+    }
     
     const options = {
         hostname: 'qi.adaptica.cz',
         port: 443,
         path: `/mobile/cgi-bin/icdisp.exe?token=${encodedToken}`,
         method: 'GET',
-        headers: {
-            'X-FunctionID': functionId,
-            'X-UserFilter': searchQuery
-        }
+        headers: headers
     };
     
     const proxyReq = https.request(options, (proxyRes) => {
@@ -218,7 +320,7 @@ function handleQiKbProxy(req, res, query) {
                     let redirectBody = '';
                     redirectRes.on('data', chunk => redirectBody += chunk);
                     redirectRes.on('end', () => {
-                        sendQiKbResponse(res, redirectBody, searchQuery);
+                        sendQiKbResponse(res, redirectBody, searchQuery, headers);
                     });
                 });
                 redirectReq.on('error', (err) => {
@@ -230,7 +332,7 @@ function handleQiKbProxy(req, res, query) {
                 return;
             }
             
-            sendQiKbResponse(res, responseBody, searchQuery);
+            sendQiKbResponse(res, responseBody, searchQuery, headers);
         });
     });
     
@@ -244,9 +346,20 @@ function handleQiKbProxy(req, res, query) {
 }
 
 /**
+ * Handle QI Configuration request
+ * Returns areas configuration for AI tools
+ */
+function handleQiConfig(req, res) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(200);
+    res.end(JSON.stringify(QI_CONFIG));
+}
+
+/**
  * Parse QI KB HTML response and send JSON
  */
-function sendQiKbResponse(res, responseBody, query) {
+function sendQiKbResponse(res, responseBody, query, requestHeaders) {
     let content = responseBody;
     
     // Check if response is HTML (contains <html or <div class="content">)
@@ -282,7 +395,12 @@ function sendQiKbResponse(res, responseBody, query) {
         status: 'success',
         query: query,
         content: content || 'Žádné výsledky',
-        hasData: content && content !== 'Nejsou data'
+        hasData: content && content !== 'Nejsou data',
+        requestHeaders: {
+            'X-FunctionID': requestHeaders['X-FunctionID'],
+            'X-UserFilter': requestHeaders['X-UserFilter'],
+            'X-Fields': requestHeaders['X-Fields'] || null
+        }
     };
     
     console.log(`📚 QI KB Result: ${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
